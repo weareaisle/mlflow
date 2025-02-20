@@ -1,152 +1,548 @@
-from contextlib import contextmanager
-import filecmp
-import mock
+import json
 import os
 import shutil
-import tempfile
+import subprocess
+import uuid
+from unittest import mock
 
+import git
 import pytest
-from six.moves import shlex_quote
 import yaml
+from databricks_cli.configure.provider import DatabricksConfig
 
 import mlflow
-from mlflow.projects import Project, ExecutionException
+from mlflow import MlflowClient
+from mlflow.entities import RunStatus, SourceType, ViewType
+from mlflow.environment_variables import MLFLOW_CONDA_CREATE_ENV_CMD, MLFLOW_CONDA_HOME
+from mlflow.exceptions import ExecutionException, MlflowException
+from mlflow.projects import _parse_kubernetes_config, _resolve_experiment_id
+from mlflow.store.tracking.file_store import FileStore
+from mlflow.utils import PYTHON_VERSION
+from mlflow.utils.conda import CONDA_EXE, get_or_create_conda_env
+from mlflow.utils.mlflow_tags import (
+    LEGACY_MLFLOW_GIT_BRANCH_NAME,
+    LEGACY_MLFLOW_GIT_REPO_URL,
+    MLFLOW_GIT_BRANCH,
+    MLFLOW_GIT_REPO_URL,
+    MLFLOW_PARENT_RUN_ID,
+    MLFLOW_PROJECT_BACKEND,
+    MLFLOW_PROJECT_ENTRY_POINT,
+    MLFLOW_PROJECT_ENV,
+    MLFLOW_SOURCE_NAME,
+    MLFLOW_SOURCE_TYPE,
+    MLFLOW_USER,
+)
+from mlflow.utils.process import ShellCommandException
 
-TEST_DIR = "tests"
-TEST_PROJECT_DIR = os.path.join(TEST_DIR, "resources", "example_project")
+from tests.projects.utils import TEST_PROJECT_DIR, TEST_PROJECT_NAME, validate_exit_status
 
-
-@contextmanager
-def temp_directory():
-    name = tempfile.mkdtemp()
-    try:
-        yield name
-    finally:
-        shutil.rmtree(name)
-
-
-def load_project():
-    with open(os.path.join(TEST_PROJECT_DIR, "MLproject")) as mlproject_file:
-        project_yaml = yaml.safe_load(mlproject_file.read())
-    return Project(uri=TEST_PROJECT_DIR, yaml_obj=project_yaml)
-
-
-def test_entry_point_compute_params():
-    project = load_project()
-    entry_point = project.get_entry_point("greeter")
-    # Pass extra "excitement" param, use default value for `greeting` param
-    with temp_directory() as storage_dir:
-        params, extra_params = entry_point.compute_parameters(
-            {"name": "friend", "excitement": 10}, storage_dir)
-        assert params == {"name": "friend", "greeting": "hi"}
-        assert extra_params == {"excitement": "10"}
-        # Don't pass extra "excitement" param, pass value for `greeting`
-        params, extra_params = entry_point.compute_parameters(
-            {"name": "friend", "greeting": "hello"}, storage_dir)
-        assert params == {"name": "friend", "greeting": "hello"}
-        assert extra_params == {}
-        # Raise exception on missing required parameter
-        with pytest.raises(ExecutionException):
-            entry_point.compute_parameters({}, storage_dir)
+MOCK_USER = "janebloggs"
 
 
-def test_entry_point_compute_command():
-    project = load_project()
-    entry_point = project.get_entry_point("greeter")
-    with temp_directory() as storage_dir:
-        command = entry_point.compute_command({"name": "friend", "excitement": 10}, storage_dir)
-        assert command == "python greeter.py hi friend --excitement 10"
-        with pytest.raises(ExecutionException):
-            entry_point.compute_command({}, storage_dir)
-        # Test shell escaping
-        name_value = "friend; echo 'hi'"
-        command = entry_point.compute_command({"name": name_value}, storage_dir)
-        assert command == "python greeter.py %s %s" % (shlex_quote("hi"), shlex_quote(name_value))
+@pytest.fixture
+def patch_user():
+    with mock.patch("mlflow.projects.utils._get_user", return_value=MOCK_USER):
+        yield
 
 
-def test_project_get_entry_point():
-    project = load_project()
-    entry_point = project.get_entry_point("greeter")
-    assert entry_point.name == "greeter"
-    assert entry_point.command == "python greeter.py {greeting} {name}"
-    # Validate parameters
-    assert set(entry_point.parameters.keys()) == set(["name", "greeting"])
-    name_param = entry_point.parameters["name"]
-    assert name_param.type == "string"
-    assert name_param.default is None
-    greeting_param = entry_point.parameters["greeting"]
-    assert greeting_param.type == "string"
-    assert greeting_param.default == "hi"
+def _get_version_local_git_repo(local_git_repo):
+    repo = git.Repo(local_git_repo, search_parent_directories=True)
+    return repo.git.rev_parse("HEAD")
 
 
-def test_project_get_unspecified_entry_point():
-    project = load_project()
-    entry_point = project.get_entry_point("my_script.py")
-    assert entry_point.name == "my_script.py"
-    assert entry_point.command == "python my_script.py"
-    assert entry_point.parameters == {}
-    entry_point = project.get_entry_point("my_script.sh")
-    assert entry_point.name == "my_script.sh"
-    assert entry_point.command == "%s my_script.sh" % os.environ.get("SHELL", "bash")
-    assert entry_point.parameters == {}
-    with pytest.raises(ExecutionException):
-        project.get_entry_point("my_program.scala")
+@pytest.fixture(scope="module", autouse=True)
+def clean_mlruns_dir():
+    yield
+    dir_path = os.path.join(TEST_PROJECT_DIR, "mlruns")
+    if os.path.exists(dir_path):
+        shutil.rmtree(dir_path)
 
 
-def test_fetch_project():
-    # Fetch local project, verify contents match
-    with temp_directory() as dst_dir:
-        mlflow.projects._fetch_project(uri=TEST_PROJECT_DIR, version=None, dst_dir=dst_dir)
-        dir_comparison = filecmp.dircmp(TEST_PROJECT_DIR, dst_dir)
-        assert len(dir_comparison.left_only) == 0
-        assert len(dir_comparison.right_only) == 0
-        assert len(dir_comparison.diff_files) == 0
-        assert len(dir_comparison.funny_files) == 0
-    # Passing `version` raises an exception for local projects
-    with temp_directory() as dst_dir:
-        with pytest.raises(ExecutionException):
-            mlflow.projects._fetch_project(uri=TEST_PROJECT_DIR, version="some-version",
-                                           dst_dir=dst_dir)
+@pytest.mark.parametrize(
+    ("experiment_name", "experiment_id", "expected"),
+    [
+        ("Default", None, "0"),
+        ("add an experiment", None, "1"),
+        (None, 2, "2"),
+        (None, "2", "2"),
+        (None, None, "0"),
+    ],
+)
+def test_resolve_experiment_id(experiment_name, experiment_id, expected):
+    assert expected == _resolve_experiment_id(
+        experiment_name=experiment_name, experiment_id=experiment_id
+    )
 
 
-def test_path_parameter():
-    # Test that download gets called for arguments of type `path`
-    project = load_project()
-    entry_point = project.get_entry_point("line_count")
-    with mock.patch("mlflow.data.download_uri") as download_uri_mock:
-        download_uri_mock.return_value = 0
-        # Verify that we don't attempt to call download_uri when passing a local file to a
-        # parameter of type "path"
-        with temp_directory() as dst_dir:
-            local_path = os.path.join(TEST_PROJECT_DIR, "MLproject")
-            params, _ = entry_point.compute_parameters(
-                user_parameters={"path": local_path},
-                storage_dir=dst_dir)
-            assert params["path"] == os.path.abspath(local_path)
-            assert download_uri_mock.call_count == 0
-        # Verify that we raise an exception when passing a non-existent local file to a
-        # parameter of type "path"
-        with temp_directory() as dst_dir, pytest.raises(ExecutionException):
-            entry_point.compute_parameters(
-                user_parameters={"path": os.path.join(dst_dir, "some/nonexistent/file")},
-                storage_dir=dst_dir)
-        # Verify that we do call `download_uri` when passing a URI to a parameter of type "path"
-        for i, prefix in enumerate(["dbfs:/", "s3://"]):
-            with temp_directory() as dst_dir:
-                entry_point.compute_parameters(
-                    user_parameters={"path": os.path.join(prefix, "some/path")},
-                    storage_dir=dst_dir)
-                assert download_uri_mock.call_count == i + 1
+def test_resolve_experiment_id_should_not_allow_both_name_and_id_in_use():
+    with pytest.raises(
+        MlflowException, match="Specify only one of 'experiment_name' or 'experiment_id'."
+    ):
+        _resolve_experiment_id(experiment_name="experiment_named", experiment_id="44")
 
 
-def test_uri_parameter():
-    project = load_project()
-    entry_point = project.get_entry_point("download_uri")
-    with mock.patch("mlflow.data.download_uri") as download_uri_mock, temp_directory() as dst_dir:
-        # Test that we don't attempt to locally download parameters of type URI
-        entry_point.compute_command(user_parameters={"uri": "file://%s" % dst_dir},
-                                    storage_dir=dst_dir)
-        assert download_uri_mock.call_count == 0
-        # Test that we raise an exception if a local path is passed to a parameter of type URI
-        with pytest.raises(ExecutionException):
-            entry_point.compute_command(user_parameters={"uri": dst_dir}, storage_dir=dst_dir)
+def test_invalid_run_mode():
+    """Verify that we raise an exception given an invalid run mode"""
+    with pytest.raises(
+        ExecutionException, match="Got unsupported execution mode some unsupported mode"
+    ):
+        mlflow.projects.run(uri=TEST_PROJECT_DIR, backend="some unsupported mode")
+
+
+def test_expected_tags_logged_when_using_conda():
+    with mock.patch.object(MlflowClient, "set_tag") as tag_mock:
+        try:
+            mlflow.projects.run(TEST_PROJECT_DIR, env_manager="conda")
+        finally:
+            tag_mock.assert_has_calls(
+                [
+                    mock.call(mock.ANY, MLFLOW_PROJECT_BACKEND, "local"),
+                    mock.call(mock.ANY, MLFLOW_PROJECT_ENV, "conda"),
+                ],
+                any_order=True,
+            )
+
+
+@pytest.mark.usefixtures("patch_user")
+@pytest.mark.parametrize("use_start_run", map(str, [0, 1]))
+@pytest.mark.parametrize("version", [None, "master", "git-commit"])
+def test_run_local_git_repo(local_git_repo, local_git_repo_uri, use_start_run, version):
+    if version is not None:
+        uri = local_git_repo_uri + "#" + TEST_PROJECT_NAME
+    else:
+        uri = os.path.join(f"{local_git_repo}/", TEST_PROJECT_NAME)
+    if version == "git-commit":
+        version = _get_version_local_git_repo(local_git_repo)
+    submitted_run = mlflow.projects.run(
+        uri,
+        entry_point="test_tracking",
+        version=version,
+        parameters={"use_start_run": use_start_run},
+        env_manager="local",
+        experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+    )
+
+    # Blocking runs should be finished when they return
+    validate_exit_status(submitted_run.get_status(), RunStatus.FINISHED)
+    # Test that we can call wait() on a synchronous run & that the run has the correct
+    # status after calling wait().
+    submitted_run.wait()
+    validate_exit_status(submitted_run.get_status(), RunStatus.FINISHED)
+    # Validate run contents in the FileStore
+    run_id = submitted_run.run_id
+    mlflow_service = MlflowClient()
+    runs = mlflow_service.search_runs(
+        [FileStore.DEFAULT_EXPERIMENT_ID], run_view_type=ViewType.ACTIVE_ONLY
+    )
+    assert len(runs) == 1
+    store_run_id = runs[0].info.run_id
+    assert run_id == store_run_id
+    run = mlflow_service.get_run(run_id)
+
+    assert run.info.status == RunStatus.to_string(RunStatus.FINISHED)
+
+    assert run.data.params == {
+        "use_start_run": use_start_run,
+    }
+    assert run.data.metrics == {"some_key": 3}
+
+    tags = run.data.tags
+    assert tags[MLFLOW_USER] == MOCK_USER
+    assert "file:" in tags[MLFLOW_SOURCE_NAME]
+    assert tags[MLFLOW_SOURCE_TYPE] == SourceType.to_string(SourceType.PROJECT)
+    assert tags[MLFLOW_PROJECT_ENTRY_POINT] == "test_tracking"
+    assert tags[MLFLOW_PROJECT_BACKEND] == "local"
+
+    if version == "master":
+        assert tags[MLFLOW_GIT_BRANCH] == "master"
+        assert tags[MLFLOW_GIT_REPO_URL] == local_git_repo_uri
+        assert tags[LEGACY_MLFLOW_GIT_BRANCH_NAME] == "master"
+        assert tags[LEGACY_MLFLOW_GIT_REPO_URL] == local_git_repo_uri
+
+
+def test_invalid_version_local_git_repo(local_git_repo_uri):
+    # Run project with invalid commit hash
+    with pytest.raises(ExecutionException, match=r"Unable to checkout version \'badc0de\'"):
+        mlflow.projects.run(
+            local_git_repo_uri + "#" + TEST_PROJECT_NAME,
+            entry_point="test_tracking",
+            version="badc0de",
+            env_manager="local",
+            experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+        )
+
+
+@pytest.mark.parametrize("use_start_run", map(str, [0, 1]))
+@pytest.mark.usefixtures("patch_user")
+def test_run(use_start_run):
+    submitted_run = mlflow.projects.run(
+        TEST_PROJECT_DIR,
+        entry_point="test_tracking",
+        parameters={"use_start_run": use_start_run},
+        env_manager="local",
+        experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+    )
+    assert submitted_run.run_id is not None
+    # Blocking runs should be finished when they return
+    validate_exit_status(submitted_run.get_status(), RunStatus.FINISHED)
+    # Test that we can call wait() on a synchronous run & that the run has the correct
+    # status after calling wait().
+    submitted_run.wait()
+    validate_exit_status(submitted_run.get_status(), RunStatus.FINISHED)
+    # Validate run contents in the FileStore
+    run_id = submitted_run.run_id
+    mlflow_service = MlflowClient()
+
+    runs = mlflow_service.search_runs(
+        [FileStore.DEFAULT_EXPERIMENT_ID], run_view_type=ViewType.ACTIVE_ONLY
+    )
+    assert len(runs) == 1
+    store_run_id = runs[0].info.run_id
+    assert run_id == store_run_id
+    run = mlflow_service.get_run(run_id)
+
+    assert run.info.status == RunStatus.to_string(RunStatus.FINISHED)
+
+    assert run.data.params == {
+        "use_start_run": use_start_run,
+    }
+    assert run.data.metrics == {"some_key": 3}
+
+    tags = run.data.tags
+    assert tags[MLFLOW_USER] == MOCK_USER
+    assert "file:" in tags[MLFLOW_SOURCE_NAME]
+    assert tags[MLFLOW_SOURCE_TYPE] == SourceType.to_string(SourceType.PROJECT)
+    assert tags[MLFLOW_PROJECT_ENTRY_POINT] == "test_tracking"
+
+
+def test_run_with_parent():
+    """Verify that if we are in a nested run, mlflow.projects.run() will have a parent_run_id."""
+    with mlflow.start_run():
+        parent_run_id = mlflow.active_run().info.run_id
+        submitted_run = mlflow.projects.run(
+            TEST_PROJECT_DIR,
+            entry_point="test_tracking",
+            parameters={"use_start_run": "1"},
+            env_manager="local",
+            experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+        )
+    assert submitted_run.run_id is not None
+    validate_exit_status(submitted_run.get_status(), RunStatus.FINISHED)
+    run_id = submitted_run.run_id
+    run = MlflowClient().get_run(run_id)
+    assert run.data.tags[MLFLOW_PARENT_RUN_ID] == parent_run_id
+
+
+def test_run_with_artifact_path(tmp_path):
+    artifact_file = tmp_path.joinpath("model.pkl")
+    artifact_file.write_text("Hello world")
+    with mlflow.start_run() as run:
+        mlflow.log_artifact(artifact_file)
+        submitted_run = mlflow.projects.run(
+            TEST_PROJECT_DIR,
+            entry_point="test_artifact_path",
+            parameters={"model": f"runs:/{run.info.run_id}/model.pkl"},
+            env_manager="local",
+            experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+        )
+        validate_exit_status(submitted_run.get_status(), RunStatus.FINISHED)
+
+
+def test_run_async():
+    submitted_run0 = mlflow.projects.run(
+        TEST_PROJECT_DIR,
+        entry_point="sleep",
+        parameters={"duration": 2},
+        env_manager="local",
+        experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+        synchronous=False,
+    )
+    validate_exit_status(submitted_run0.get_status(), RunStatus.RUNNING)
+    submitted_run0.wait()
+    validate_exit_status(submitted_run0.get_status(), RunStatus.FINISHED)
+    submitted_run1 = mlflow.projects.run(
+        TEST_PROJECT_DIR,
+        entry_point="sleep",
+        parameters={"duration": -1, "invalid-param": 30},
+        env_manager="local",
+        experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+        synchronous=False,
+    )
+    submitted_run1.wait()
+    validate_exit_status(submitted_run1.get_status(), RunStatus.FAILED)
+
+
+@pytest.mark.parametrize(
+    ("mock_env", "expected_conda", "expected_activate"),
+    [
+        (
+            {CONDA_EXE: "/abc/conda"},
+            "/abc/conda",
+            "/abc/activate",
+        ),
+        (
+            {MLFLOW_CONDA_HOME.name: "/some/dir/"},
+            "/some/dir/bin/conda",
+            "/some/dir/bin/activate",
+        ),
+    ],
+)
+def test_conda_path(mock_env, expected_conda, expected_activate, monkeypatch):
+    """Verify that we correctly determine the path to conda executables"""
+    monkeypatch.delenvs([CONDA_EXE, MLFLOW_CONDA_HOME.name], raising=False)
+    monkeypatch.setenvs(mock_env)
+    assert mlflow.utils.conda.get_conda_bin_executable("conda") == expected_conda
+    assert mlflow.utils.conda.get_conda_bin_executable("activate") == expected_activate
+
+
+@pytest.mark.parametrize(
+    ("mock_env", "expected_conda_env_create_path"),
+    [
+        (
+            {CONDA_EXE: "/abc/conda"},
+            "/abc/conda",
+        ),
+        (
+            {CONDA_EXE: "/abc/conda", MLFLOW_CONDA_CREATE_ENV_CMD.name: "mamba"},
+            "/abc/mamba",
+        ),
+        (
+            {MLFLOW_CONDA_HOME.name: "/some/dir/"},
+            "/some/dir/bin/conda",
+        ),
+        (
+            {MLFLOW_CONDA_HOME.name: "/some/dir/", MLFLOW_CONDA_CREATE_ENV_CMD.name: "mamba"},
+            "/some/dir/bin/mamba",
+        ),
+    ],
+)
+def test_find_conda_executables(mock_env, expected_conda_env_create_path, monkeypatch):
+    """
+    Verify that we correctly determine the path to executables to be used to
+    create environments (for example, it could be mamba instead of conda)
+    """
+    monkeypatch.delenvs(
+        [CONDA_EXE, MLFLOW_CONDA_HOME.name, MLFLOW_CONDA_CREATE_ENV_CMD.name], raising=False
+    )
+    monkeypatch.setenvs(mock_env)
+    conda_env_create_path = mlflow.utils.conda._get_conda_executable_for_create_env()
+    assert conda_env_create_path == expected_conda_env_create_path
+
+
+def test_create_env_with_mamba(monkeypatch):
+    """
+    Test that mamba is called when set, and that we fail when mamba is not available or is
+    not working. We mock the calls so we do not actually execute mamba (which is not
+    installed in the test environment anyway)
+    """
+
+    def exec_cmd_mock(cmd, *args, **kwargs):  # pylint: disable=unused-argument
+        if cmd[-1] == "--json":
+            # We are supposed to list environments in JSON format
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"envs": ["mlflow-mock-environment"]}), None
+            )
+        else:
+            # Here we are creating the environment, no need to return
+            # anything
+            return subprocess.CompletedProcess(cmd, 0)
+
+    def exec_cmd_mock_raise(cmd, *args, **kwargs):  # pylint: disable=unused-argument
+        if os.path.basename(cmd[0]) == "mamba":
+            raise OSError()
+
+    conda_env_path = os.path.join(TEST_PROJECT_DIR, "conda.yaml")
+
+    monkeypatch.setenv(MLFLOW_CONDA_CREATE_ENV_CMD.name, "mamba")
+    # Simulate success
+    with mock.patch("mlflow.utils.process._exec_cmd", side_effect=exec_cmd_mock):
+        mlflow.utils.conda.get_or_create_conda_env(conda_env_path)
+
+    # Simulate a non-working or non-existent mamba
+    with mock.patch("mlflow.utils.process._exec_cmd", side_effect=exec_cmd_mock_raise):
+        with pytest.raises(
+            ExecutionException,
+            match="You have set the env variable MLFLOW_CONDA_CREATE_ENV_CMD",
+        ):
+            mlflow.utils.conda.get_or_create_conda_env(conda_env_path)
+
+
+def test_conda_environment_cleaned_up_when_pip_fails(tmp_path):
+    conda_yaml = tmp_path / "conda.yaml"
+    content = f"""
+name: {uuid.uuid4().hex}
+channels:
+  - conda-forge
+dependencies:
+  - python={PYTHON_VERSION}
+  - pip
+  - pip:
+      - mlflow==999.999.999
+"""
+    conda_yaml.write_text(content)
+    envs_before = mlflow.utils.conda._list_conda_environments()
+
+    # `conda create` should fail because mlflow 999.999.999 doesn't exist
+    with pytest.raises(ShellCommandException, match=r"No matching distribution found"):
+        mlflow.utils.conda.get_or_create_conda_env(conda_yaml, capture_output=True)
+
+    # Ensure the environment is cleaned up
+    envs_after = mlflow.utils.conda._list_conda_environments()
+    assert envs_before == envs_after
+
+
+def test_cancel_run():
+    submitted_run0, submitted_run1 = (
+        mlflow.projects.run(
+            TEST_PROJECT_DIR,
+            entry_point="sleep",
+            parameters={"duration": 2},
+            env_manager="local",
+            experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+            synchronous=False,
+        )
+        for _ in range(2)
+    )
+    submitted_run0.cancel()
+    validate_exit_status(submitted_run0.get_status(), RunStatus.FAILED)
+    # Sanity check: cancelling one run has no effect on the other
+    assert submitted_run1.wait()
+    validate_exit_status(submitted_run1.get_status(), RunStatus.FINISHED)
+    # Try cancelling after calling wait()
+    submitted_run1.cancel()
+    validate_exit_status(submitted_run1.get_status(), RunStatus.FINISHED)
+
+
+def test_parse_kubernetes_config():
+    work_dir = "./examples/docker"
+    kubernetes_config = {
+        "kube-context": "docker-for-desktop",
+        "kube-job-template-path": os.path.join(work_dir, "kubernetes_job_template.yaml"),
+        "repository-uri": "dockerhub_account/mlflow-kubernetes-example",
+    }
+    yaml_obj = None
+    with open(kubernetes_config["kube-job-template-path"]) as job_template:
+        yaml_obj = yaml.safe_load(job_template.read())
+    kube_config = _parse_kubernetes_config(kubernetes_config)
+    assert kube_config["kube-context"] == kubernetes_config["kube-context"]
+    assert kube_config["kube-job-template-path"] == kubernetes_config["kube-job-template-path"]
+    assert kube_config["repository-uri"] == kubernetes_config["repository-uri"]
+    assert kube_config["kube-job-template"] == yaml_obj
+
+
+@pytest.fixture
+def mock_kubernetes_job_template(tmp_path):
+    k8s_yaml = tmp_path.joinpath("kubernetes_job_template.yaml")
+    k8s_yaml.write_text(
+        """
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "{replaced with MLflow Project name}"
+  namespace: mlflow
+spec:
+  ttlSecondsAfterFinished: 100
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - name: "{replaced with MLflow Project name}"
+        image: "{replaced with URI of Docker image created during Project execution}"
+        command: ["{replaced with MLflow Project entry point command}"]
+        resources:
+          limits:
+            memory: 512Mi
+          requests:
+            memory: 256Mi
+      restartPolicy: Never
+""".lstrip()
+    )
+    return str(k8s_yaml)
+
+
+class StartsWithMatcher:
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+    def __eq__(self, other):
+        return isinstance(other, str) and other.startswith(self.prefix)
+
+
+def test_parse_kubernetes_config_without_context(mock_kubernetes_job_template):
+    with mock.patch("mlflow.projects._logger.debug") as mock_debug:
+        kubernetes_config = {
+            "repository-uri": "dockerhub_account/mlflow-kubernetes-example",
+            "kube-job-template-path": mock_kubernetes_job_template,
+        }
+        _parse_kubernetes_config(kubernetes_config)
+        mock_debug.assert_called_once_with(
+            StartsWithMatcher("Could not find kube-context in backend_config")
+        )
+
+
+def test_parse_kubernetes_config_without_image_uri(mock_kubernetes_job_template):
+    kubernetes_config = {
+        "kube-context": "docker-for-desktop",
+        "kube-job-template-path": mock_kubernetes_job_template,
+    }
+    with pytest.raises(ExecutionException, match="Could not find 'repository-uri'"):
+        _parse_kubernetes_config(kubernetes_config)
+
+
+def test_parse_kubernetes_config_invalid_template_job_file():
+    kubernetes_config = {
+        "kube-context": "docker-for-desktop",
+        "repository-uri": "username/mlflow-kubernetes-example",
+        "kube-job-template-path": "file_not_found.yaml",
+    }
+    with pytest.raises(ExecutionException, match="Could not find 'kube-job-template-path'"):
+        _parse_kubernetes_config(kubernetes_config)
+
+
+@pytest.mark.parametrize("synchronous", [True, False])
+@mock.patch("databricks_cli.configure.provider.get_config")
+def test_credential_propagation(get_config, synchronous):
+    class DummyProcess:
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self, _):
+            return "", ""
+
+    get_config.return_value = DatabricksConfig.from_token("host", "mytoken", insecure=False)
+    with mock.patch("subprocess.Popen", return_value=DummyProcess()) as popen_mock, mock.patch(
+        "mlflow.utils.uri.is_databricks_uri", return_value=True
+    ):
+        mlflow.projects.run(
+            TEST_PROJECT_DIR,
+            entry_point="sleep",
+            experiment_id=FileStore.DEFAULT_EXPERIMENT_ID,
+            parameters={"duration": 2},
+            env_manager="local",
+            synchronous=synchronous,
+        )
+        _, kwargs = popen_mock.call_args
+        env = kwargs["env"]
+        assert env["DATABRICKS_HOST"] == "host"
+        assert env["DATABRICKS_TOKEN"] == "mytoken"
+
+
+def test_get_or_create_conda_env_capture_output_mode(tmp_path):
+    conda_yaml_file = tmp_path / "conda.yaml"
+    conda_yaml_file.write_text(
+        """
+channels:
+- conda-forge
+dependencies:
+- pip:
+  - scikit-learn==99.99.99
+"""
+    )
+    with pytest.raises(
+        ShellCommandException,
+        match="Could not find a version that satisfies the requirement scikit-learn==99.99.99",
+    ):
+        get_or_create_conda_env(str(conda_yaml_file), capture_output=True)

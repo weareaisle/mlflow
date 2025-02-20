@@ -2,7 +2,7 @@
 #
 
 # You can set these variables from the command line.
-SPHINXOPTS    =
+SPHINXOPTS    = -W --keep-going -n -T
 SPHINXBUILD   = sphinx-build
 PAPER         =
 BUILDDIR      = build
@@ -56,11 +56,36 @@ help:
 clean:
 	rm -rf $(BUILDDIR)/*
 
-.PHONY: html
-html:
+.PHONY: javadocs
+javadocs:
+	./build-javadoc.sh
+
+.PHONY: rdocs
+rdocs:
+	./build-rdoc.sh
+
+.PHONY: test-examples
+test-examples:
+	@pytest --no-cov .examples
+
+.PHONY: gateway-api-docs
+gateway-api-docs:
+	@python gateway_api_docs.py
+
+# Builds only the RST-based documentation (i.e., everything but Java & R docs)
+.PHONY: rsthtml
+rsthtml: gateway-api-docs
 	$(SPHINXBUILD) -b html $(ALLSPHINXOPTS) $(BUILDDIR)/html
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/html."
+	@echo "Use 'make view' to preview docs."
+
+.PHONY: view
+view:
+	python -m http.server --directory build/html
+
+.PHONY: html
+html: rdocs rsthtml javadocs
 
 .PHONY: dirhtml
 dirhtml:
@@ -76,7 +101,9 @@ singlehtml:
 
 .PHONY: livehtml
 livehtml:
-	sphinx-autobuild -b html $(ALLSPHINXOPTS) $(BUILDDIR)/html
+	# Remove `--keep-going` option because `sphinx-autobuild` doesn't support it and raises an error.
+	# See: https://github.com/executablebooks/sphinx-autobuild/blob/master/src/sphinx_autobuild/build.py#L7
+	sphinx-autobuild -b html $(shell echo $(ALLSPHINXOPTS) | sed -e "s/--keep-going//g") $(BUILDDIR)/html
 		
 .PHONY: pickle
 pickle:

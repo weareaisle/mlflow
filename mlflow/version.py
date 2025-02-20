@@ -1,3 +1,8 @@
 # Copyright 2018 Databricks, Inc.
+import re
 
-version = '0.1.0' #  NOQA
+VERSION = "2.8.2.dev0"
+
+
+def is_release_version():
+    return bool(re.match(r"^\d+\.\d+\.\d+$", VERSION))
